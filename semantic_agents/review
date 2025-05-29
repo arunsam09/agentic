@@ -1,0 +1,252 @@
+from agents.azure_reviewer_agent import AzureAIReviewerAgent
+
+agent_reviewer = AzureAIReviewerAgent(
+    conn_str="your_project_connection_string",
+    index_name="your_index_name",
+    model_name="your_model_name",
+    agent_name="AzureReviewer",
+    instructions="""Your instructions here"""
+)
+
+import asyncio
+import os
+
+from semantic_kernel import Kernel
+from semantic_kernel.agents import AgentGroupChat, ChatCompletionAgent
+from semantic_kernel.agents.strategies import (
+    KernelFunctionSelectionStrategy,
+    KernelFunctionTerminationStrategy,
+)
+from semantic_kernel.contents import ChatHistoryTruncationReducer
+from semantic_kernel.functions import KernelFunctionFromPrompt
+
+from kernel_config import create_kernel
+from agents.azure_reviewer_agent import AzureAIReviewerAgent
+from agents.reviewer_wrapper import ReviewerWrapperAgent  # You will create this
+from agents.writer_agent import create_writer_agent  # Optional: if using helper
+
+REVIEWER_NAME = "Reviewer"
+WRITER_NAME = "Writer"
+
+
+async def main():
+    kernel = create_kernel()
+
+    # Create Azure-based Reviewer Agent and wrap it
+    azure_reviewer = AzureAIReviewerAgent(
+        conn_str="your_project_connection_string",
+        index_name="your_index_name",
+        model_name="your_model_name",
+        agent_name=REVIEWER_NAME,
+        instructions="""
+Your responsibility is to review and identify how to improve user provided content.
+If the user has provided input or direction for content already provided, specify how to address this input.
+Never directly perform the correction or provide an example.
+Once the content has been updated in a subsequent response, review it again until it is satisfactory.
+
+RULES:
+- Only identify suggestions that are specific and actionable.
+- Verify previous suggestions have been addressed.
+- Never repeat previous suggestions.
+"""
+    )
+
+    agent_reviewer = ReviewerWrapperAgent(azure_reviewer)
+
+    # Writer Agent using SK
+    agent_writer = ChatCompletionAgent(
+        kernel=kernel,
+        name=WRITER_NAME,
+        instructions="""
+Your sole responsibility is to rewrite content according to review suggestions.
+- Always apply all review directions.
+- Always revise the content in its entirety without explanation.
+- Never address the user.
+"""
+    )
+
+    # Strategy logic
+    selection_function = KernelFunctionFromPrompt(
+        function_name="selection",
+        prompt=f"""
+Examine the provided RESPONSE and choose the next participant.
+State only the name of the chosen participant without explanation.
+Never choose the participant named in the RESPONSE.
+
+Choose only from these participants:
+- {REVIEWER_NAME}
+- {WRITER_NAME}
+
+Rules:
+- If RESPONSE is user input, it is {REVIEWER_NAME}'s turn.
+- If RESPONSE is by {REVIEWER_NAME}, it is {WRITER_NAME}'s turn.
+- If RESPONSE is by {WRITER_NAME}, it is {REVIEWER_NAME}'s turn.
+
+RESPONSE:
+{{{{$lastmessage}}}}
+"""
+    )
+
+    termination_keyword = "yes"
+
+    termination_function = KernelFunctionFromPrompt(
+        function_name="termination",
+        prompt=f"""
+Examine the RESPONSE and determine whether the content has been deemed satisfactory.
+If the content is satisfactory, respond with a single word without explanation: {termination_keyword}.
+If specific suggestions are being provided, it is not satisfactory.
+If no correction is suggested, it is satisfactory.
+
+RESPONSE:
+{{{{$lastmessage}}}}
+"""
+    )
+
+    history_reducer = ChatHistoryTruncationReducer(target_count=1)
+
+    chat = AgentGroupChat(
+        agents=[agent_reviewer, agent_writer],
+        selection_strategy=KernelFunctionSelectionStrategy(
+            initial_agent=agent_reviewer,
+            function=selection_function,
+            kernel=kernel,
+            result_parser=lambda result: str(result.value[0]).strip() if result.value[0] is not None else WRITER_NAME,
+            history_variable_name="lastmessage",
+            history_reducer=history_reducer,
+        ),
+        termination_strategy=KernelFunctionTerminationStrategy(
+            agents=[agent_reviewer],
+            function=termination_function,
+            kernel=kernel,
+            result_parser=lambda result: termination_keyword in str(result.value[0]).lower(),
+            history_variable_name="lastmessage",
+            maximum_iterations=10,
+            history_reducer=history_reducer,
+        ),
+    )
+
+    print(
+        "Ready! Type your input, or 'exit' to quit, 'reset' to restart the conversation. "
+        "You may pass in a file path using @<path_to_file>."
+    )
+
+    is_complete = False
+    while not is_complete:
+        print()
+        user_input = input("User > ").strip()
+        if not user_input:
+            continue
+
+        if user_input.lower() == "exit":
+            is_complete = True
+            break
+
+        if user_input.lower() == "reset":
+            await chat.reset()
+            print("[Conversation has been reset]")
+            continue
+
+        if user_input.startswith("@") and len(user_input) > 1:
+            file_name = user_input[1:]
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            file_path = os.path.join(script_dir, file_name)
+            try:
+                if not os.path.exists(file_path):
+                    print(f"Unable to access file: {file_path}")
+                    continue
+                with open(file_path, encoding="utf-8") as file:
+                    user_input = file.read()
+            except Exception:
+                print(f"Unable to access file: {file_path}")
+                continue
+
+        await chat.add_chat_message(message=user_input)
+
+        try:
+            async for response in chat.invoke():
+                if response is None or not response.name:
+                    continue
+                print()
+                print(f"# {response.name.upper()}:\n{response.content}")
+        except Exception as e:
+            print(f"Error during chat invocation: {e}")
+
+        chat.is_complete = False
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+
+
+
+from azure.identity import DefaultAzureCredential
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import AzureAISearchTool
+
+class AzureAIReviewerAgent:
+    def __init__(self, conn_str, index_name, model_name, agent_name, instructions):
+        self.client = AIProjectClient.from_connection_string(
+            credential=DefaultAzureCredential(),
+            conn_str=conn_str
+        )
+
+        conn_list = self.client.connections._list_connections()["value"]
+        self.conn_id = next(
+            (conn["id"] for conn in conn_list
+             if conn["properties"].get("metadata", {}).get("type", "").upper() == "AZURE_AI_SEARCH"),
+            None
+        )
+
+        self.ai_search_tool = AzureAISearchTool(
+            index_connection_id=self.conn_id,
+            index_name=index_name,
+            query_type="Hybrid"
+        )
+
+        self.agent = self.client.agents.create_agent(
+            model=model_name,
+            name=agent_name,
+            instructions=instructions,
+            tools=self.ai_search_tool.definitions,
+            tool_resources=self.ai_search_tool.resources
+        )
+
+    def respond(self, user_input: str) -> str:
+        thread = self.client.agents.create_thread()
+        message = self.client.agents.create_message(
+            thread_id=thread.id,
+            role="user",
+            content=user_input
+        )
+        run = self.client.agents.create_and_process_run(
+            thread_id=thread.id,
+            assistant_id=self.agent.id
+        )
+
+        # Wait for completion (polling)
+        while run.status not in ["succeeded", "failed"]:
+            run = self.client.agents.get_run(thread.id, run.id)
+
+        if run.status == "succeeded":
+            messages = self.client.agents.list_messages(thread.id)
+            responses = [msg.content for msg in messages if msg.role == "assistant"]
+            return "\n".join(responses).strip()
+
+        return "[Error]: Azure AI run failed or timed out"
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
