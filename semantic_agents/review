@@ -1,3 +1,20 @@
+class ReviewerWrapperAgent:
+    def __init__(self, azure_agent):
+        self.agent = azure_agent
+        self.name = "Reviewer"
+        self.instructions = "Custom Azure AI Reviewer agent"
+
+    async def invoke(self, input: str):
+        response = self.agent.respond(input)
+        return type("Response", (), {
+            "name": self.name,
+            "content": response
+        })()
+
+
+
+
+
 from agents.azure_reviewer_agent import AzureAIReviewerAgent
 
 agent_reviewer = AzureAIReviewerAgent(
